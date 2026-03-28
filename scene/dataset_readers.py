@@ -30,7 +30,9 @@ class CameraInfo(NamedTuple):
     FovY: np.array
     FovX: np.array
     image: np.array
+    semantic_mask: np.array
     image_path: str
+    semantic_mask_path: str
     image_name: str
     width: int
     height: int
@@ -65,7 +67,20 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def _resolve_mask_path(mask_folder, image_name, suffix):
+    stem, ext = os.path.splitext(image_name)
+    candidates = [
+        os.path.join(mask_folder, f"{stem}{suffix}{ext}"),
+        os.path.join(mask_folder, f"{stem}{suffix}.png"),
+        os.path.join(mask_folder, f"{stem}{suffix}.jpg"),
+        os.path.join(mask_folder, f"{stem}{suffix}.jpeg"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, masks_folder=None, mask_suffix="_aug"):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -97,9 +112,16 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
+        semantic_mask = None
+        semantic_mask_path = None
+        if masks_folder is not None:
+            semantic_mask_path = _resolve_mask_path(masks_folder, os.path.basename(extr.name), mask_suffix)
+            if semantic_mask_path is not None:
+                semantic_mask = Image.open(semantic_mask_path)
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              semantic_mask=semantic_mask, image_path=image_path,
+                              semantic_mask_path=semantic_mask_path, image_name=image_name, width=width, height=height)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -129,7 +151,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, llffhold=8):
+def readColmapSceneInfo(path, images, eval, llffhold=8, masks="augimages", mask_suffix="_aug"):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -142,7 +164,16 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    mask_dir = os.path.join(path, masks) if masks else None
+    if mask_dir is not None and not os.path.isdir(mask_dir):
+        mask_dir = None
+    cam_infos_unsorted = readColmapCameras(
+        cam_extrinsics=cam_extrinsics,
+        cam_intrinsics=cam_intrinsics,
+        images_folder=os.path.join(path, reading_dir),
+        masks_folder=mask_dir,
+        mask_suffix=mask_suffix,
+    )
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
@@ -214,7 +245,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             FovX = fovx
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+                            semantic_mask=None, image_path=image_path, semantic_mask_path=None,
+                            image_name=image_name, width=image.size[0], height=image.size[1]))
             
     return cam_infos
 

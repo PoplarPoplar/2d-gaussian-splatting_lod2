@@ -20,6 +20,11 @@ def l1_loss(network_output, gt):
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 
+def masked_l1_loss(network_output, gt, mask, eps=1e-6):
+    diff = torch.abs(network_output - gt) * mask
+    denom = mask.sum() * network_output.shape[0] + eps
+    return diff.sum() / denom
+
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
     return gauss / gauss.sum()
@@ -71,4 +76,3 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
         return ssim_map.mean()
     else:
         return ssim_map.mean(1).mean(1).mean(1)
-

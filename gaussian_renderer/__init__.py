@@ -16,7 +16,21 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def _rasterize(viewpoint_camera, rasterizer, means3D, means2D, opacity, scales, rotations, cov3D_precomp, shs, colors_precomp):
+    return rasterizer(
+        means3D = means3D,
+        means2D = means2D,
+        shs = shs,
+        colors_precomp = colors_precomp,
+        opacities = opacity,
+        scales = scales,
+        rotations = rotations,
+        cov3D_precomp = cov3D_precomp
+    )
+
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None,
+           enable_semantic = False,
+           semantic_filter = False, semantic_threshold = 0.5, semantic_hard_gate = False):
     """
     Render the scene. 
     
@@ -55,6 +69,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
+    render_opacity = opacity
+    if semantic_filter:
+        render_opacity = opacity * pc.get_semantic_gate(threshold=semantic_threshold, hard=semantic_hard_gate)
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -94,16 +111,20 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         colors_precomp = override_color
     
-    rendered_image, radii, allmap = rasterizer(
-        means3D = means3D,
-        means2D = means2D,
-        shs = shs,
-        colors_precomp = colors_precomp,
-        opacities = opacity,
-        scales = scales,
-        rotations = rotations,
-        cov3D_precomp = cov3D_precomp
+    rendered_image, radii, allmap = _rasterize(
+        viewpoint_camera, rasterizer, means3D, means2D, render_opacity, scales, rotations, cov3D_precomp, shs, colors_precomp
     )
+
+    semantic_image = None
+    if enable_semantic:
+        semantic_rgb = pc.get_semantic_feature.repeat(1, 3)
+        semantic_bg = torch.zeros_like(bg_color)
+        semantic_raster_settings = raster_settings._replace(bg=semantic_bg)
+        semantic_rasterizer = GaussianRasterizer(raster_settings=semantic_raster_settings)
+        semantic_image_rgb, _, _ = _rasterize(
+            viewpoint_camera, semantic_rasterizer, means3D, means2D, opacity, scales, rotations, cov3D_precomp, None, semantic_rgb
+        )
+        semantic_image = semantic_image_rgb[:1]
     
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
@@ -154,5 +175,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'surf_depth': surf_depth,
             'surf_normal': surf_normal,
     })
+    if semantic_image is not None:
+        rets['semantic_image'] = semantic_image
 
     return rets

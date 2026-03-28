@@ -38,6 +38,7 @@ class GaussianModel:
         self.covariance_activation = build_covariance_from_scaling_rotation
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
+        self.semantic_activation = torch.sigmoid
         self.rotation_activation = torch.nn.functional.normalize
 
 
@@ -50,6 +51,7 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._semantic_feature = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -67,6 +69,7 @@ class GaussianModel:
             self._scaling,
             self._rotation,
             self._opacity,
+            self._semantic_feature,
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
@@ -82,6 +85,7 @@ class GaussianModel:
         self._scaling, 
         self._rotation, 
         self._opacity,
+        self._semantic_feature,
         self.max_radii2D, 
         xyz_gradient_accum, 
         denom,
@@ -113,6 +117,26 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
+
+    @property
+    def get_semantic_feature(self):
+        return self.semantic_activation(self._semantic_feature)
+
+    @property
+    def get_semantic_logits(self):
+        return self._semantic_feature
+
+    @property
+    def get_normal(self):
+        rotation = build_rotation(self.get_rotation)
+        return rotation[:, :, 2]
+
+    def get_semantic_gate(self, threshold=0.5, hard=False):
+        semantic_prob = self.get_semantic_feature
+        if hard:
+            hard_mask = (semantic_prob > threshold).float()
+            return semantic_prob + (hard_mask - semantic_prob).detach()
+        return semantic_prob
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_xyz, self.get_scaling, scaling_modifier, self._rotation)
@@ -143,6 +167,7 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._semantic_feature = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda").requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):
@@ -156,7 +181,8 @@ class GaussianModel:
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+            {'params': [self._semantic_feature], 'lr': training_args.semantic_feature_lr, "name": "semantic_feature"},
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -185,23 +211,40 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        for i in range(self._semantic_feature.shape[1]):
+            l.append('semantic_{}'.format(i))
         return l
 
-    def save_ply(self, path):
+    def save_ply(self, path, building_only=False, threshold=0.5, include_semantic=True):
         mkdir_p(os.path.dirname(path))
 
-        xyz = self._xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
-        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        opacities = self._opacity.detach().cpu().numpy()
-        scale = self._scaling.detach().cpu().numpy()
-        rotation = self._rotation.detach().cpu().numpy()
+        if building_only:
+            keep_mask = (self.get_semantic_feature.squeeze(-1) > threshold).detach().cpu().numpy()
+        else:
+            keep_mask = np.ones((self._xyz.shape[0],), dtype=bool)
 
-        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+        xyz = self._xyz.detach().cpu().numpy()[keep_mask]
+        normals = self.get_normal.detach().cpu().numpy()[keep_mask]
+        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()[keep_mask]
+        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()[keep_mask]
+        opacities = self._opacity.detach().cpu().numpy()[keep_mask]
+        scale = self._scaling.detach().cpu().numpy()[keep_mask]
+        rotation = self._rotation.detach().cpu().numpy()[keep_mask]
+        semantic = self._semantic_feature.detach().cpu().numpy()[keep_mask]
+
+        attributes_list = self.construct_list_of_attributes()
+        if not include_semantic:
+            attributes_list = [attr for attr in attributes_list if not attr.startswith("semantic_")]
+        dtype_full = [(attribute, 'f4') for attribute in attributes_list]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        if xyz.shape[0] == 0:
+            PlyData([PlyElement.describe(elements, 'vertex')]).write(path)
+            return
+        if include_semantic:
+            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, semantic), axis=1)
+        else:
+            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -245,12 +288,22 @@ class GaussianModel:
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
+        semantic_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("semantic_")]
+        semantic_names = sorted(semantic_names, key = lambda x: int(x.split('_')[-1]))
+        if len(semantic_names) == 0:
+            semantic = np.zeros((xyz.shape[0], 1), dtype=np.float32)
+        else:
+            semantic = np.zeros((xyz.shape[0], len(semantic_names)))
+            for idx, attr_name in enumerate(semantic_names):
+                semantic[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._semantic_feature = nn.Parameter(torch.tensor(semantic, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -297,6 +350,7 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._semantic_feature = optimizable_tensors["semantic_feature"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -325,13 +379,14 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_semantic_feature):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
-        "rotation" : new_rotation}
+        "rotation" : new_rotation,
+        "semantic_feature": new_semantic_feature}
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -340,6 +395,7 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._semantic_feature = optimizable_tensors["semantic_feature"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -365,8 +421,9 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_semantic_feature = self._semantic_feature[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_semantic_feature)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -383,8 +440,9 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        new_semantic_feature = self._semantic_feature[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_semantic_feature)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
@@ -405,3 +463,34 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def prune_semantic_background(self, threshold=0.5):
+        prune_mask = (self.get_semantic_feature.squeeze(-1) <= threshold)
+        if prune_mask.any():
+            self.prune_points(prune_mask)
+
+    def save_building_ply(self, path, threshold=0.5):
+        mkdir_p(os.path.dirname(path))
+
+        semantic_mask = (self.get_semantic_feature.squeeze(-1) > threshold).detach().cpu().numpy()
+        xyz = self._xyz.detach().cpu().numpy()[semantic_mask]
+        normals = self.get_normal.detach().cpu().numpy()[semantic_mask]
+        opacities = self.get_opacity.detach().cpu().numpy()[semantic_mask]
+        scale = self.get_scaling.detach().cpu().numpy()[semantic_mask]
+
+        dtype_full = [
+            ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+            ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
+            ('opacity', 'f4')
+        ]
+        for i in range(scale.shape[1] if scale.ndim == 2 else 0):
+            dtype_full.append((f'scale_{i}', 'f4'))
+
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        if xyz.shape[0] == 0:
+            PlyData([PlyElement.describe(elements, 'vertex')]).write(path)
+            return
+
+        attributes = np.concatenate((xyz, normals, opacities, scale), axis=1)
+        elements[:] = list(map(tuple, attributes))
+        PlyData([PlyElement.describe(elements, 'vertex')]).write(path)

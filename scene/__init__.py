@@ -29,6 +29,9 @@ class Scene:
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+        self.enable_semantic_training = getattr(args, "enable_semantic_training", False)
+        self.train_only_building = self.enable_semantic_training and getattr(args, "train_only_building", False)
+        self.save_full_point_cloud = self.enable_semantic_training and getattr(args, "save_full_point_cloud", False)
 
         if load_iteration:
             if load_iteration == -1:
@@ -41,7 +44,7 @@ class Scene:
         self.test_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, masks=args.masks, mask_suffix=args.mask_suffix)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
@@ -84,7 +87,15 @@ class Scene:
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-        self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        self.gaussians.save_ply(
+            os.path.join(point_cloud_path, "point_cloud.ply"),
+            building_only=self.train_only_building,
+            include_semantic=self.enable_semantic_training,
+        )
+        if self.save_full_point_cloud:
+            self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud_full.ply"), include_semantic=True)
+        if self.enable_semantic_training:
+            self.gaussians.save_building_ply(os.path.join(point_cloud_path, "building_only.ply"))
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

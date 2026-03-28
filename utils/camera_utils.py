@@ -13,6 +13,7 @@ from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
+from PIL import Image
 
 WARNED = False
 
@@ -48,10 +49,17 @@ def loadCam(args, id, cam_info, resolution_scale):
         loaded_mask = None
         gt_image = resized_image_rgb
 
+    gt_semantic_mask = None
+    if cam_info.semantic_mask is not None:
+        semantic_mask = cam_info.semantic_mask.convert("L") if isinstance(cam_info.semantic_mask, Image.Image) else cam_info.semantic_mask
+        gt_semantic_mask = PILtoTorch(semantic_mask, resolution)[:1]
+        gt_semantic_mask = (gt_semantic_mask > 0.5).float()
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  gt_semantic_mask=gt_semantic_mask, image_name=cam_info.image_name,
+                  uid=id, data_device=args.data_device)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

@@ -4,6 +4,7 @@ output
 build
 data
 *.ply
+*.obj
 **/PKG-INFO
 # submodules
 **__pycache__**
@@ -12,3 +13,4 @@ data
 eval
 *.npz
 **/tmp
+reference

@@ -11,8 +11,9 @@
 
 import os
 import torch
+import torch.nn.functional as F
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ssim, masked_l1_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -48,6 +49,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_dist_for_log = 0.0
     ema_normal_for_log = 0.0
+    ema_semantic_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -66,12 +68,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
         
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+        semantic_enabled = dataset.enable_semantic_training
+        semantic_hard_gate = semantic_enabled and dataset.train_only_building and iteration >= opt.semantic_hard_gate_from_iter
+        render_pkg = render(
+            viewpoint_cam,
+            gaussians,
+            pipe,
+            background,
+            enable_semantic=semantic_enabled,
+            semantic_filter=dataset.train_only_building,
+            semantic_threshold=opt.semantic_gate_threshold,
+            semantic_hard_gate=semantic_hard_gate,
+        )
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        if semantic_enabled and dataset.train_only_building and viewpoint_cam.gt_semantic_mask is not None:
+            rgb_mask = viewpoint_cam.gt_semantic_mask.cuda().expand_as(gt_image)
+            masked_image = image * rgb_mask
+            masked_gt = gt_image * rgb_mask
+            Ll1 = masked_l1_loss(image, gt_image, rgb_mask)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(masked_image, masked_gt))
+        else:
+            Ll1 = l1_loss(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+
+        semantic_loss = torch.zeros(1, device=image.device)
+        if semantic_enabled and viewpoint_cam.gt_semantic_mask is not None:
+            semantic_image = render_pkg["semantic_image"]
+            gt_semantic_mask = viewpoint_cam.gt_semantic_mask.cuda()
+            semantic_loss = opt.lambda_semantic * F.binary_cross_entropy(
+                semantic_image.clamp(1e-6, 1.0 - 1e-6),
+                gt_semantic_mask
+            )
         
         # regularization
         lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
@@ -85,7 +114,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         dist_loss = lambda_dist * (rend_dist).mean()
 
         # loss
-        total_loss = loss + dist_loss + normal_loss
+        total_loss = loss + dist_loss + normal_loss + semantic_loss
         
         total_loss.backward()
 
@@ -96,6 +125,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_dist_for_log = 0.4 * dist_loss.item() + 0.6 * ema_dist_for_log
             ema_normal_for_log = 0.4 * normal_loss.item() + 0.6 * ema_normal_for_log
+            ema_semantic_for_log = 0.4 * semantic_loss.item() + 0.6 * ema_semantic_for_log
 
 
             if iteration % 10 == 0:
@@ -103,6 +133,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Loss": f"{ema_loss_for_log:.{5}f}",
                     "distort": f"{ema_dist_for_log:.{5}f}",
                     "normal": f"{ema_normal_for_log:.{5}f}",
+                    "semantic": f"{ema_semantic_for_log:.{5}f}",
                     "Points": f"{len(gaussians.get_xyz)}"
                 }
                 progress_bar.set_postfix(loss_dict)
@@ -115,6 +146,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if tb_writer is not None:
                 tb_writer.add_scalar('train_loss_patches/dist_loss', ema_dist_for_log, iteration)
                 tb_writer.add_scalar('train_loss_patches/normal_loss', ema_normal_for_log, iteration)
+                tb_writer.add_scalar('train_loss_patches/semantic_loss', ema_semantic_for_log, iteration)
 
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
@@ -139,6 +171,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
+            if semantic_enabled and dataset.train_only_building and iteration >= opt.semantic_hard_gate_from_iter:
+                if iteration % opt.semantic_prune_interval == 0:
+                    gaussians.prune_semantic_background(opt.semantic_gate_threshold)
+
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
@@ -151,7 +187,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     net_image_bytes = None
                     custom_cam, do_training, keep_alive, scaling_modifer, render_mode = network_gui.receive()
                     if custom_cam != None:
-                        render_pkg = render(custom_cam, gaussians, pipe, background, scaling_modifer)   
+                        render_pkg = render(
+                            custom_cam,
+                            gaussians,
+                            pipe,
+                            background,
+                            scaling_modifer,
+                            enable_semantic=semantic_enabled,
+                            semantic_filter=dataset.train_only_building,
+                            semantic_threshold=opt.semantic_gate_threshold,
+                            semantic_hard_gate=True,
+                        )
                         net_image = render_net_image(render_pkg, dataset.render_items, render_mode, custom_cam)
                         net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                     metrics_dict = {

@@ -46,10 +46,15 @@ class ParamGroup:
 
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
-        self.sh_degree = 3
+        self.sh_degree = 0
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
+        self.enable_semantic_training = False
+        self.masks = "augimages"
+        self.mask_suffix = "_aug"
+        self.train_only_building = True
+        self.save_full_point_cloud = False
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
@@ -78,6 +83,7 @@ class OptimizationParams(ParamGroup):
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 30_000
         self.feature_lr = 0.0025
+        self.semantic_feature_lr = 0.0025
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
@@ -85,6 +91,10 @@ class OptimizationParams(ParamGroup):
         self.lambda_dssim = 0.2
         self.lambda_dist = 0.0
         self.lambda_normal = 0.05
+        self.lambda_semantic = 0.05
+        self.semantic_gate_threshold = 0.5
+        self.semantic_hard_gate_from_iter = 5000
+        self.semantic_prune_interval = 1000
         self.opacity_cull = 0.05
 
         self.densification_interval = 100
